@@ -1,0 +1,18 @@
+services:
+  sam3-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sam3-unity:1.0.0
+    container_name: sam3-unity-server
+    gpus: all
+    ports:
+      - "8765:8765"
+    volumes:
+      # Reuses your host's `hf auth login` session and checkpoint cache, so the
+      # container never needs its own login and doesn't re-download ~3.4GB.
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      # Optional shared secret: `SAM3_TOKEN=... docker compose up`
+      - SAM3_TOKEN=${SAM3_TOKEN:-}
+    restart: unless-stopped
