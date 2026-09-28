@@ -12,7 +12,11 @@ services:
       # Reuses your host's `hf auth login` session and checkpoint cache, so the
       # container never needs its own login and doesn't re-download ~3.4GB.
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ./output:/app/output
     environment:
       # Optional shared secret: `SAM3_TOKEN=... docker compose up`
       - SAM3_TOKEN=${SAM3_TOKEN:-}
+      # Optional: `SAM3_DEBUG_DIR=/app/output docker compose up` saves the latest
+      # received frame + result to ./output every few seconds (off by default).
+      - SAM3_DEBUG_DIR=${SAM3_DEBUG_DIR:-}
     restart: unless-stopped

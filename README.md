@@ -81,17 +81,20 @@ Scripts are in [`unity/Sam3Stream/`](unity/Sam3Stream):
 | Script | What it does |
 |---|---|
 | `Sam3StreamClient.cs` | WebSocket client. Sends frames from any `Texture`, receives masks, shows them on `RawImage`s, and reconnects automatically. |
-| `QuestPassthroughCameraSource.cs` | Requests camera permissions, opens a Quest passthrough camera as a `WebCamTexture`, and feeds it to the client. In the Editor it uses your PC webcam. |
+| `QuestPassthroughCameraSource.cs` | Requests the headset-camera permission and feeds the live texture from Meta's `PassthroughCameraAccess` component to the client. |
 
-1. Copy `unity/Sam3Stream/*.cs` into your project's `Assets/`.
-2. Add a **world-space Canvas** in front of the user with two stacked,
+1. Install Meta's **MR Utility Kit (MRUK)** package, which provides the
+   `PassthroughCameraAccess` component.
+2. Copy `unity/Sam3Stream/*.cs` into your project's `Assets/`.
+3. Add a **world-space Canvas** in front of the user with two stacked,
    same-size `RawImage`s: `Preview` (the camera frame) and `Mask` on top.
-3. Add `Sam3StreamClient` to an empty GameObject. Set `Server Url` to
+4. Add `Sam3StreamClient` to an empty GameObject. Set `Server Url` to
    `ws://<IP>:8765/ws`, set `Token` and `Prompts`, and assign the two
    RawImages.
-4. Add `QuestPassthroughCameraSource` to the same GameObject and drag the
-   client into its `Client` field.
-5. Android settings:
+5. Add a **`PassthroughCameraAccess`** component to the scene. Then add
+   `QuestPassthroughCameraSource` to the client's GameObject and assign
+   both the `PassthroughCameraAccess` component and the client.
+6. Android settings:
    - *Player > Other Settings > Internet Access = Require*.
    - If the connection is refused, also set *Allow downloads over HTTP =
      Always allowed*.
@@ -100,7 +103,7 @@ Scripts are in [`unity/Sam3Stream/`](unity/Sam3Stream):
      <uses-permission android:name="android.permission.CAMERA" />
      <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
      ```
-6. The Quest and the server must be on the same network, and that network
+7. The Quest and the server must be on the same network, and that network
    must allow device-to-device traffic. Campus and guest Wi-Fi (e.g.
    eduroam) often isolates clients. If `http://<IP>:8765/` doesn't load in
    the Quest browser, use a router or hotspot you control.
@@ -118,6 +121,34 @@ Texture2D mask = client.MaskTexture;       // latest RGBA overlay
 ```
 
 Boxes are normalized `[x0, y0, x1, y1]` with the origin at the top-left.
+
+## Troubleshooting: "connected, but no mask"
+
+While frames flow, the server prints a status line every 5 seconds for each
+client:
+
+```
+[stats] 167.96.152.6:46944 2.8 fps | frames 640x480 | brightness 6/255 | gpu 330 ms | dropped 0 | found: cup in 0/14 frames
+  WARNING: frames are almost black - camera covered, headset not worn, or the client isn't reading the live camera texture
+```
+
+| What you see | Meaning |
+|---|---|
+| `[connect]` but no `[stats]` | Connected, but no frames are being sent. The camera source isn't ready: check `PassthroughCameraAccess` and the headset-camera permission. |
+| `brightness` below ~20 + WARNING | Frames are black. Wear the headset (cameras uncovered), and make sure the client reads `cameraAccess.GetTexture()` live. |
+| `found: cup in 0/N` with normal brightness | SAM 3 sees the scene but no match. Try another wording, or a lower `threshold` (e.g. 0.3). |
+| `found: cup in N/N` but nothing in the headset | Unity display issue. Check that `Mask Image` is assigned and `Mask` is drawn on top of `Preview`. |
+
+To see exactly what the headset sends, start the server with debug
+snapshots. Every 5 seconds this writes `output/latest_frame.jpg` (the raw
+frame received) and `output/latest_result.jpg` (the frame with the mask on
+top):
+
+```bash
+SAM3_TOKEN=... SAM3_DEBUG_DIR=/app/output docker compose up
+```
+
+Snapshots contain your camera images, so they are off by default.
 
 ## Performance
 
@@ -155,7 +186,7 @@ Endpoint: `ws://<host>:8765/ws` (append `?token=...` if the server has one).
 |---|---|---|
 | client → server | text | `{"type":"config","prompts":["cup"],"threshold":0.5}` |
 | client → server | binary | 4-byte little-endian `uint32` frame id, then JPEG bytes |
-| server → client | text | `{"type":"result","frame_id","width","height","inference_ms","detections":[{"prompt","prompt_index","score","box","color"}],"mask_png"}` |
+| server → client | text | `{"type":"result","frame_id","width","height","inference_ms","brightness","detections":[{"prompt","prompt_index","score","box","color"}],"mask_png"}` |
 | server → client | text | `ready`, `config_ack`, `error` (`{"type":"error","message",...}`) |
 
 `mask_png` is a base64 RGBA PNG the same size as the frame. It is
@@ -171,7 +202,7 @@ sam3-unity/
 │   └── stream_client.py   # Python test client (image or webcam)
 ├── unity/Sam3Stream/
 │   ├── Sam3StreamClient.cs              # Unity WebSocket client
-│   └── QuestPassthroughCameraSource.cs  # Quest 3 passthrough camera -> client
+│   └── QuestPassthroughCameraSource.cs  # MRUK PassthroughCameraAccess -> client
 ├── examples/stream_result.png
 ├── Dockerfile             # fetches SAM 3's code at build time; no weights baked in
 ├── docker-compose.yml
@@ -182,9 +213,10 @@ sam3-unity/
 
 ## Limitations / next steps
 
-- **Masks are shown on a panel, not anchored to the real world.** Lining
-  them up with passthrough needs the camera's intrinsics and pose. Meta's
-  Passthrough Camera API samples show how to get both.
+- **Masks are shown on a panel, not anchored to the real world.**
+  `PassthroughCameraAccess` already exposes what's needed to line them up
+  with passthrough: `Intrinsics`, `GetCameraPose()` and
+  `ViewportPointToRay()`.
 - Around 2-3 FPS on a GB10. A faster GPU, fewer prompts or `torch.compile`
   are the main levers.
 - `ReadPixels` + `EncodeToJPG` run on the main thread. `AsyncGPUReadback`

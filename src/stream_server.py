@@ -39,12 +39,13 @@ import json
 import os
 import struct
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket
-from PIL import Image
+from PIL import Image, ImageStat
 
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
@@ -56,13 +57,16 @@ PALETTE = [
 MASK_ALPHA = 150
 MAX_PROMPTS = 10
 MAX_DETECTIONS = 20
+STATS_INTERVAL_S = 5.0
+DARK_FRAME_BRIGHTNESS = 20
 
 # All GPU work runs on this single thread: it serializes access to the one
 # model and keeps torch.autocast (which is thread-local) in one place.
 GPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sam3-gpu")
 processor: Sam3Processor | None = None
 auth_token: str | None = None
-app = FastAPI(title="SAM 3 stream server")
+debug_dir: str | None = None
+app =FastAPI(title="SAM 3 stream server")
 
 
 def load_processor() -> Sam3Processor:
@@ -73,6 +77,7 @@ def load_processor() -> Sam3Processor:
 def run_frame(proc: Sam3Processor, jpeg: bytes, prompts: list[str], threshold: float) -> dict:
     image = Image.open(io.BytesIO(jpeg)).convert("RGB")
     w, h = image.size
+    brightness = ImageStat.Stat(image.convert("L")).mean[0]
     t0 = time.perf_counter()
     detections = []
     mask_png = None
@@ -107,9 +112,61 @@ def run_frame(proc: Sam3Processor, jpeg: bytes, prompts: list[str], threshold: f
         "width": w,
         "height": h,
         "inference_ms": round((time.perf_counter() - t0) * 1000, 1),
+        "brightness": round(brightness, 1),
         "detections": detections,
         "mask_png": mask_png,
     }
+
+
+class Stats:
+    """Per-connection counters, printed every STATS_INTERVAL_S while frames flow."""
+
+    def __init__(self):
+        self.received = 0
+        self._reset()
+
+    def _reset(self):
+        self.start = time.monotonic()
+        self.received_at_start = self.received
+        self.processed = 0
+        self.gpu_ms = 0.0
+        self.brightness = 0.0
+        self.frames_with = Counter()
+        self.size = None
+
+    def add(self, result: dict):
+        self.processed += 1
+        self.gpu_ms += result["inference_ms"]
+        self.brightness += result["brightness"]
+        self.frames_with.update({d["prompt"] for d in result["detections"]})
+        self.size = f"{result['width']}x{result['height']}"
+
+    def due(self) -> bool:
+        return time.monotonic() - self.start >= STATS_INTERVAL_S
+
+    def report(self, prompts: list[str]) -> str:
+        n = self.processed
+        dropped = self.received - self.received_at_start - n
+        found = ", ".join(f"{p} in {self.frames_with[p]}/{n} frames" for p in prompts) or "no prompts set"
+        brightness = self.brightness / n
+        line = (f"{n / (time.monotonic() - self.start):.1f} fps | frames {self.size} | "
+                f"brightness {brightness:.0f}/255 | gpu {self.gpu_ms / n:.0f} ms | "
+                f"dropped {max(dropped, 0)} | found: {found}")
+        if brightness < DARK_FRAME_BRIGHTNESS:
+            line += ("\n  WARNING: frames are almost black - camera covered, headset not worn, "
+                     "or the client isn't reading the live camera texture")
+        self._reset()
+        return line
+
+
+def save_snapshot(jpeg: bytes, mask_png: str | None) -> None:
+    """Writes what the client actually sent (and the result on top) for remote debugging."""
+    with open(os.path.join(debug_dir, "latest_frame.jpg"), "wb") as f:
+        f.write(jpeg)
+    frame = Image.open(io.BytesIO(jpeg)).convert("RGBA")
+    if mask_png:
+        frame.alpha_composite(Image.open(io.BytesIO(base64.b64decode(mask_png))))
+    frame.convert("RGB").save(os.path.join(debug_dir, "latest_result.jpg"), quality=90)
 
 
 def parse_config(cmd: dict, cfg: dict) -> None:
@@ -143,22 +200,34 @@ async def stream(ws: WebSocket):
     cfg = {"prompts": [], "threshold": 0.5}
     latest: dict = {"frame": None}
     new_frame = asyncio.Event()
+    stats = Stats()
+    last_snapshot = 0.0
 
     async def infer_loop():
+        nonlocal last_snapshot
         loop = asyncio.get_running_loop()
         try:
             while True:
                 await new_frame.wait()
                 new_frame.clear()
                 frame_id, jpeg = latest["frame"]
+                prompts = list(cfg["prompts"])
                 try:
                     result = await loop.run_in_executor(
-                        GPU, run_frame, processor, jpeg, list(cfg["prompts"]), cfg["threshold"]
+                        GPU, run_frame, processor, jpeg, prompts, cfg["threshold"]
                     )
                 except Exception as e:  # bad JPEG, CUDA OOM, ...: report and keep serving
+                    print(f"[error] {client} frame {frame_id}: {e}", flush=True)
                     await ws.send_json({"type": "error", "frame_id": frame_id, "message": str(e)})
                     continue
                 await ws.send_json({"type": "result", "frame_id": frame_id, **result})
+
+                stats.add(result)
+                if stats.due():
+                    print(f"[stats] {client} {stats.report(prompts)}", flush=True)
+                if debug_dir and time.monotonic() - last_snapshot >= STATS_INTERVAL_S:
+                    last_snapshot = time.monotonic()
+                    await asyncio.to_thread(save_snapshot, jpeg, result["mask_png"])
         except Exception:
             pass  # socket closed while sending; the receive loop handles cleanup
 
@@ -173,6 +242,7 @@ async def stream(ws: WebSocket):
             if data is not None:
                 if len(data) > 4:
                     latest["frame"] = (struct.unpack_from("<I", data)[0], data[4:])
+                    stats.received += 1
                     new_frame.set()
             elif msg.get("text"):
                 try:
@@ -190,7 +260,7 @@ async def stream(ws: WebSocket):
 
 
 def main(argv=None):
-    global processor, auth_token
+    global processor, auth_token, debug_dir
     parser = argparse.ArgumentParser(description="SAM 3 live stream segmentation server")
     parser.add_argument("--host", default="0.0.0.0", help="Interface to bind (0.0.0.0 = all, reachable from the LAN)")
     parser.add_argument("--port", type=int, default=8765)
@@ -198,8 +268,16 @@ def main(argv=None):
         "--token", default=os.environ.get("SAM3_TOKEN") or None,
         help="Optional shared secret (default: $SAM3_TOKEN); clients must connect with ?token=...",
     )
+    parser.add_argument(
+        "--debug-dir", default=os.environ.get("SAM3_DEBUG_DIR") or None,
+        help="If set (default: $SAM3_DEBUG_DIR), save the latest received frame and result here every few seconds",
+    )
     args = parser.parse_args(argv)
     auth_token = args.token
+    debug_dir = args.debug_dir
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        print(f"Debug snapshots -> {debug_dir}/latest_frame.jpg, latest_result.jpg", flush=True)
 
     print("Loading SAM 3 (downloads the checkpoint on first run)...", flush=True)
     processor = GPU.submit(load_processor).result()

@@ -1,60 +1,60 @@
 using System.Collections;
+using Meta.XR;
 using UnityEngine;
 using UnityEngine.Android;
 
-/// Opens a Quest 3 / 3S passthrough camera (Horizon OS v74+) as a WebCamTexture and
-/// feeds it to a Sam3StreamClient. In the Unity Editor it opens your PC webcam instead.
+/// Feeds the Quest 3 / 3S passthrough camera (MRUK's PassthroughCameraAccess) to a Sam3StreamClient.
 public class QuestPassthroughCameraSource : MonoBehaviour
 {
     const string HeadsetCameraPermission = "horizonos.permission.HEADSET_CAMERA";
 
-    public Sam3StreamClient client;
-    [Tooltip("On Quest 3, 0 and 1 are the left and right passthrough cameras")]
-    public int deviceIndex = 0;
-    public int requestedWidth = 1280;
-    public int requestedHeight = 960;
+    [Header("Meta Quest Passthrough Camera")]
+    public PassthroughCameraAccess cameraAccess;
 
-    public WebCamTexture Texture { get; private set; }
+    [Header("SAM3 Client")]
+    public Sam3StreamClient client;
+
+    bool loggedWaiting;
 
     IEnumerator Start()
     {
+        if (cameraAccess == null) Debug.LogError("[SAM3] PassthroughCameraAccess is not assigned.");
+        if (client == null) Debug.LogError("[SAM3] Sam3StreamClient is not assigned.");
+
 #if UNITY_ANDROID && !UNITY_EDITOR
-        foreach (var permission in new[] { Permission.Camera, HeadsetCameraPermission })
+        // PassthroughCameraAccess only returns a valid texture once this permission is granted,
+        // and it does not request it by itself.
+        if (!Permission.HasUserAuthorizedPermission(HeadsetCameraPermission))
         {
-            if (Permission.HasUserAuthorizedPermission(permission)) continue;
             bool? granted = null;
             var callbacks = new PermissionCallbacks();
             callbacks.PermissionGranted += _ => granted = true;
             callbacks.PermissionDenied += _ => granted = false;
-            Permission.RequestUserPermission(permission, callbacks);
+            Permission.RequestUserPermission(HeadsetCameraPermission, callbacks);
             while (granted == null) yield return null;
-            if (!granted.Value)
-            {
-                Debug.LogError($"[SAM3] permission {permission} denied - cannot access the passthrough camera");
-                yield break;
-            }
+            if (!granted.Value) Debug.LogError("[SAM3] Headset camera permission denied.");
         }
 #endif
-        // The device list can take a moment to populate after the permission is granted.
-        for (float t = 0; WebCamTexture.devices.Length == 0 && t < 5f; t += 0.25f)
-            yield return new WaitForSeconds(0.25f);
-
-        var devices = WebCamTexture.devices;
-        if (devices.Length == 0)
-        {
-            Debug.LogError("[SAM3] no camera found (Quest 3/3S with Horizon OS v74+ required on device)");
-            yield break;
-        }
-
-        var device = devices[Mathf.Clamp(deviceIndex, 0, devices.Length - 1)];
-        Texture = new WebCamTexture(device.name, requestedWidth, requestedHeight, 30);
-        Texture.Play();
-        Debug.Log($"[SAM3] camera '{device.name}' started");
-        if (client != null) client.source = Texture;
+        yield break;
     }
 
-    void OnDestroy()
+    void Update()
     {
-        if (Texture != null) Texture.Stop();
+        if (cameraAccess == null || client == null) return;
+
+        if (!cameraAccess.IsPlaying)
+        {
+            if (!loggedWaiting) Debug.Log("[SAM3] Waiting for passthrough camera...");
+            loggedWaiting = true;
+            return;
+        }
+
+        // Re-read every frame: the component can hand out a new texture after a
+        // pause/resume or resolution change, and a stale one streams as black.
+        Texture cameraTexture = cameraAccess.GetTexture();
+        if (cameraTexture == null || client.source == cameraTexture) return;
+
+        client.source = cameraTexture;
+        Debug.Log($"[SAM3] Passthrough camera connected: {cameraTexture.width} x {cameraTexture.height}");
     }
 }
